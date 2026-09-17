@@ -1,10 +1,10 @@
-FROM node:20-alpine
+FROM node:24-alpine
 
 WORKDIR /app
 
 # Install dependencies first (cache layer)
 COPY package.json pnpm-lock.yaml* ./
-RUN corepack enable && corepack prepare pnpm@10.33.0 --activate
+RUN corepack enable && corepack prepare pnpm@12.4.2 --activate
 RUN pnpm install --frozen-lockfile --ignore-workspace --prod
 
 # Copy source

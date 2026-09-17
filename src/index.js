@@ -12,12 +12,14 @@
  * Runs over stdio. Install with `npm i -g @maideo/mcp` then add to your
  * Claude Desktop / Claude Code / ChatGPT MCP client config.
  */
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { createRequire } from "node:module";
+import { McpServer, fromJsonSchema } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+
+// Read from package.json rather than repeating the literal: the release CI only
+// checks the tag against package.json, so a second hardcoded version here could
+// drift and ship a server announcing the wrong one.
+const PKG_VERSION = createRequire(import.meta.url)("../package.json").version;
 
 const API_BASE =
   process.env.MAIDEO_API_BASE || "https://api.maideo.fr/public/agent";
@@ -55,17 +57,15 @@ async function apiRequest(path, { method = "GET", body, bookingToken } = {}) {
   return data;
 }
 
-const server = new Server(
-  {
-    name: "@maideo/mcp",
-    version: "0.1.3",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
+// bookingId is interpolated into the request path: a bare string let
+// "../../x" climb out of /public/agent/booking/ on the same host, carrying the
+// caller's bookingToken. The gateway only ever issues a Mongo ObjectId here
+// (controllers/public-agent/book.js), and Ajv enforces the pattern since the v2 SDK.
+const BOOKING_ID_SCHEMA = {
+  type: "string",
+  pattern: "^[0-9a-f]{24}$",
+  description: "bookingId returned by create_booking",
+};
 
 const TOOLS = [
   {
@@ -173,9 +173,14 @@ const TOOLS = [
           },
         },
         dateDebut: {
+          // No `format: "date-time"`: since the v2 SDK, schema keywords are
+          // ENFORCED by Ajv before the handler runs, and RFC 3339 would reject
+          // "2026-08-15" and offset-less local times that the API accepts
+          // (controllers/public-agent/book.js parses with dayjs + isValid).
+          // Keeping it would break already-published clients.
           type: "string",
-          format: "date-time",
-          description: "First intervention date (ISO 8601)",
+          description:
+            "First intervention date, ISO 8601 (e.g. 2026-08-15 or 2026-08-15T09:00:00Z). Must be in the future.",
         },
         frequency: {
           type: "string",
@@ -212,7 +217,7 @@ const TOOLS = [
         "coordonneeBancaire",
       ],
       properties: {
-        bookingId: { type: "string" },
+        bookingId: BOOKING_ID_SCHEMA,
         bookingToken: { type: "string" },
         civilite: {
           type: "string",
@@ -238,8 +243,13 @@ const TOOLS = [
           },
         },
         numeroTelephonePortable: {
+          // Separators tolerated here and stripped before the call: the pattern
+          // is enforced by Ajv since the v2 SDK, and a human-formatted
+          // "+33 6 12 34 56 78" used to reach the API untouched. URSSAF still
+          // receives the compact form.
           type: "string",
-          pattern: "^(0|\\+33)[6-7]([0-9]{2}){4}$",
+          pattern: "^(0|\\+33)[\\s.-]?[6-7]([\\s.-]?[0-9]{2}){4}$",
+          description: "French mobile number, e.g. 0612345678 or +33 6 12 34 56 78",
         },
         adresseMail: { type: "string", format: "email" },
         adressePostale: {
@@ -272,19 +282,14 @@ const TOOLS = [
       type: "object",
       required: ["bookingId", "bookingToken"],
       properties: {
-        bookingId: { type: "string" },
+        bookingId: BOOKING_ID_SCHEMA,
         bookingToken: { type: "string" },
       },
     },
   },
 ];
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
-}));
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+async function callTool(name, args) {
   try {
     let result;
     switch (name) {
@@ -312,8 +317,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       case "enroll_avance_immediate": {
         const { bookingId, bookingToken, ...urssafPayload } = args;
+        if (urssafPayload.numeroTelephonePortable) {
+          urssafPayload.numeroTelephonePortable =
+            urssafPayload.numeroTelephonePortable.replace(/[\s.-]/g, "");
+        }
         result = await apiRequest(
-          `/booking/${bookingId}/enroll-urssaf`,
+          `/booking/${encodeURIComponent(bookingId)}/enroll-urssaf`,
           {
             method: "POST",
             body: urssafPayload,
@@ -324,7 +333,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       case "get_booking_status": {
         const { bookingId, bookingToken } = args;
-        result = await apiRequest(`/booking/${bookingId}`, {
+        result = await apiRequest(`/booking/${encodeURIComponent(bookingId)}`, {
           bookingToken,
         });
         break;
@@ -353,8 +362,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ],
     };
   }
-});
+}
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// `serveStdio` serves both protocol eras off one factory: already-installed
+// clients keep the initialize handshake, a 2026-07-28 client gets the stateless
+// protocol and `server/discover`. Both come from the SDK defaults — passing
+// `supportedProtocolVersions` would only narrow what `initialize` can negotiate.
+function buildServer() {
+  const server = new McpServer({ name: "@maideo/mcp", version: PKG_VERSION });
+  for (const tool of TOOLS) {
+    server.registerTool(
+      tool.name,
+      {
+        description: tool.description,
+        inputSchema: fromJsonSchema(tool.inputSchema),
+      },
+      (args) => callTool(tool.name, args ?? {})
+    );
+  }
+  return server;
+}
+
+// Build once eagerly: `serveStdio` only calls its factory on the first client
+// message and swallows construction errors into an opaque -32603, so a bad
+// schema would otherwise ship as a server that silently answers nothing.
+buildServer();
+
+serveStdio(buildServer, {
+  onerror: (err) => console.error("[@maideo/mcp] error:", err),
+});
 console.error("[@maideo/mcp] Server running on stdio");

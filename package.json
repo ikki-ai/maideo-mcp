@@ -1,6 +1,6 @@
 {
   "name": "@maideo/mcp",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Official MCP server for the Maideo Agent API — book home cleaning services in France end-to-end",
   "type": "module",
   "main": "src/index.js",
@@ -30,10 +30,10 @@
   "author": "Maideo <dev@maideo.fr>",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/server": "^2.0.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "repository": {
     "type": "git",
